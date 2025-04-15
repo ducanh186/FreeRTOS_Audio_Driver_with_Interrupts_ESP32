@@ -1,6 +1,4 @@
-Sure! Below is an example of a **README.md** file for your project in English. This file introduces the components, functionality, tasks, and task scheduling in the project.
 
----
 
 # ESP32 Music Player with Button Control
 
@@ -124,5 +122,3 @@ This project demonstrates how to control audio playback on an **ESP32** using tw
 ### Additional Notes:
 1. **Task management** in FreeRTOS ensures efficient handling of multiple tasks, where the task that listens to button presses has the highest priority to make sure user inputs are processed immediately.
 2. **I2S** is used to interface with the speaker or DAC for audio output, ensuring high-quality sound playback.
-
-Feel free to modify and expand the project as needed!

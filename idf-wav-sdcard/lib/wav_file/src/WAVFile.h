@@ -1,5 +1,6 @@
 #pragma once
-
+/* Tệp header chỉ được biên dịch một lần trong quá trình biên dịch,
+ tránh việc định nghĩa lại cấu trúc hoặc các khai báo khác nhiều lần nếu tệp được include ở nhiều nơi */
 #pragma pack(push, 1)
 typedef struct _wav_header
 {

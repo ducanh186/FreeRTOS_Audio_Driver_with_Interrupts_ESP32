@@ -13,6 +13,7 @@ protected:
 
 public:
   Output(i2s_port_t i2s_port);
+  virtual ~Output() = default;
   virtual void start(int sample_rate) = 0;
   void stop();
   // override this in derived classes to turn the sample into

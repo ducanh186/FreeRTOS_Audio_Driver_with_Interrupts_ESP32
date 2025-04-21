@@ -16,7 +16,7 @@ void Output::stop()
 {
   // stop the i2S driver
   i2s_stop(m_i2s_port);
-  i2s_driver_uninstall(m_i2s_port);
+  // i2s_driver_uninstall(m_i2s_port);
 }
 
 void Output::write(int16_t *samples, int count)

@@ -2,6 +2,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <dirent.h>
+#include <string.h>
 
 #include "I2SOutput.h"
 #include "SDCard.h"
@@ -17,6 +19,7 @@ extern "C" {
 // Global variables for managing playback state
 static bool is_main_music_playing = false;
 static bool is_background_music_playing = false;
+static bool mix_requested = false;
 static TaskHandle_t main_music_task_handle = NULL;
 static TaskHandle_t background_music_task_handle = NULL;
 
@@ -37,136 +40,101 @@ void wait_for_second_button_push()
   }
 }
 
-// Play a specific WAV file
-void play(Output *output, const char *fname)
+void play_with_mix(Output *output, const char *main_fname, const char *mix_fname)
 {
-  int16_t *samples = (int16_t *)malloc(sizeof(int16_t) * 1024);
-  ESP_LOGI(TAG, "Opening file: %s", fname);  // Log when a file is about to be opened
+  int16_t *main_buf = (int16_t *)malloc(sizeof(int16_t) * 1024);
+  int16_t *mix_buf = (int16_t *)malloc(sizeof(int16_t) * 1024);
+  int16_t *output_buf = (int16_t *)malloc(sizeof(int16_t) * 1024);
 
-  FILE *fp = fopen(fname, "rb");
-  if (fp == NULL)
-  {
-    ESP_LOGE(TAG, "Failed to open WAV file: %s", fname);
-    free(samples);
+  FILE *main_fp = fopen(main_fname, "rb");
+  FILE *mix_fp = fopen(mix_fname, "rb");
+  if (!main_fp || !mix_fp) {
+    ESP_LOGE(TAG, "Failed to open files");
+    free(main_buf); free(mix_buf); free(output_buf);
+    if (main_fp) fclose(main_fp);
+    if (mix_fp) fclose(mix_fp);
     return;
   }
 
-  // Create a new WAV file reader
-  WAVFileReader *reader = new WAVFileReader(fp);
-  ESP_LOGI(TAG, "Start playing file: %s", fname);
-  output->start(reader->sample_rate());
+  WAVFileReader *main_reader = new WAVFileReader(main_fp);
+  WAVFileReader *mix_reader = new WAVFileReader(mix_fp);
 
-  while (true)
-  {
-    int samples_read = reader->read(samples, 1024);
-    if (samples_read == 0)
-    {
-      ESP_LOGI(TAG, "End of file reached: %s", fname);
-      break;
+  ESP_LOGI(TAG, "Sample rate file 1: %d", main_reader->sample_rate());
+  ESP_LOGI(TAG, "Sample rate file 2: %d", mix_reader->sample_rate());
+  output->start(main_reader->sample_rate()*2);
+
+  while (is_main_music_playing) {
+    int main_samples = main_reader->read(main_buf, 1024);
+    if (main_samples == 0) break;
+    if (mix_requested) {
+      int mix_samples = mix_reader->read(mix_buf, main_samples);
+      for (int i = 0; i < main_samples; i++) {
+        int32_t mixed = main_buf[i];
+        if (mix_requested && i < mix_samples) {
+          mixed += mix_buf[i];
+          output_buf[i] = mixed / 2;
+        } 
+        else {
+          output_buf[i] = main_buf[i];
+        }
+      }
+      if (mix_samples == 0) {
+        mix_requested = false; // Reset mix request if no more samples
+        fseek(mix_fp, 44, SEEK_SET); // Reset to start if needed
+      }
+    } else {
+      memcpy(output_buf, main_buf, main_samples * sizeof(int16_t));
     }
-    output->write(samples, samples_read);
+    output->write(output_buf, main_samples);
   }
-
+  ESP_LOGI(TAG, "Finished playing main music");
   output->stop();
-  fclose(fp);
-  delete reader;
-  free(samples);
-  ESP_LOGI(TAG, "Finished playing: %s", fname);  // Log when file playback finishes
+  delete main_reader;
+  delete mix_reader;
+  if (main_fp) fclose(main_fp);
+  if (mix_fp) fclose(mix_fp);
+  free(main_buf); free(mix_buf); free(output_buf);
 }
 
-// Task to play main music (main_music.wav)
-void main_music_task(void *pvParameters)
+void main_music_task(void *pvParameters) {
+  I2SOutput *output = new I2SOutput(I2S_NUM_0, i2s_speaker_pins);
+  play_with_mix(output, "/sdcard/gong.wav", "/sdcard/huh.wav");
+  vTaskDelay(pdMS_TO_TICKS(100));
+  delete output;
+  main_music_task_handle = NULL;  
+  vTaskDelete(NULL); // Self delete when done
+}
+
+void button_toggle_music_task(void *pvParameters)
 {
+
   while (true)
   {
-    if (is_main_music_playing)
-    {
-      ESP_LOGI(TAG, "Playing main music...");
-      play(new I2SOutput(I2S_NUM_0, i2s_speaker_pins), "/sdcard/main_music.wav");
+    if (gpio_get_level(GPIO_BUTTON) == 1) {
+      ESP_LOGI(TAG, "GPIO_BUTTON pressed");
+      is_main_music_playing = !is_main_music_playing;
+      if (is_main_music_playing) {
+        ESP_LOGI(TAG, "Main music started playing");
+        if (main_music_task_handle == NULL) {
+          xTaskCreate(main_music_task, "main_music_task", 4096, NULL, 1, &main_music_task_handle);
+        }
+        else is_main_music_playing = false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(500)); // Debounce delay to avoid repeated triggering
     }
-    vTaskDelay(pdMS_TO_TICKS(100));  // Delay for a while before checking the status again
+    vTaskDelay(pdMS_TO_TICKS(100)); // Check every 100 ms
   }
 }
 
-// Task to play background music (background_music_1.wav)
-void background_music_task(void *pvParameters)
+void button_trigger_mix_task(void *pvParameters)
 {
-  while (true)
-  {
-    if (is_background_music_playing)
-    {
-      ESP_LOGI(TAG, "Playing background music...");
-      play(new I2SOutput(I2S_NUM_0, i2s_speaker_pins), "/sdcard/background_music_1.wav");
+  while (true) {
+    if (gpio_get_level(GPIO_BUTTON_1) == 1) {
+      ESP_LOGI(TAG, "GPIO_BUTTON_1 pressed - mix requested");
+      mix_requested = !mix_requested; // Toggle mixing on/off
+      vTaskDelay(pdMS_TO_TICKS(500)); // Debounce delay to avoid repeated triggering
     }
-    vTaskDelay(pdMS_TO_TICKS(100));  // Delay for a while before checking the status again
-  }
-}
-
-// Main task for GPIO button press handling
-void handle_button_push(void *pvParameters)  // Thêm đối số void* cho phù hợp với xTaskCreate
-{
-  gpio_set_direction(GPIO_BUTTON, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(GPIO_BUTTON, GPIO_PULLDOWN_ONLY);  // Setup GPIO button for play
-  gpio_set_direction(GPIO_BUTTON_1, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(GPIO_BUTTON_1, GPIO_PULLDOWN_ONLY); // Setup GPIO button for play alternate song
-
-  while (true)
-  {
-    // Wait for the user to push and hold the first button (GPIO_BUTTON)
-    wait_for_button_push();
-    ESP_LOGI(TAG, "GPIO_BUTTON pressed");
-
-    // Toggle playing main music when GPIO_BUTTON is pressed
-    is_main_music_playing = !is_main_music_playing;
-    if (is_main_music_playing)
-    {
-      ESP_LOGI(TAG, "Main music started playing");
-      // Start main music task
-      if (main_music_task_handle == NULL)
-      {
-        xTaskCreate(main_music_task, "main_music_task", 8192, NULL, 1, &main_music_task_handle);
-      }
-    }
-    else
-    {
-      ESP_LOGI(TAG, "Main music stopped");
-      // Stop main music task
-      if (main_music_task_handle != NULL)
-      {
-        vTaskDelete(main_music_task_handle);
-        main_music_task_handle = NULL;
-      }
-    }
-
-    // Wait for the user to push the second button (GPIO_BUTTON_1) to start background music
-    wait_for_second_button_push();
-    ESP_LOGI(TAG, "GPIO_BUTTON_1 pressed");
-
-    // Start or stop background music when GPIO_BUTTON_1 is pressed
-    if (is_main_music_playing)  // Ensure main music is playing before playing background music
-    {
-      is_background_music_playing = !is_background_music_playing;
-      if (is_background_music_playing)
-      {
-        ESP_LOGI(TAG, "Background music started playing");
-        // Start background music task
-        if (background_music_task_handle == NULL)
-        {
-          xTaskCreate(background_music_task, "background_music_task", 8192, NULL, 1, &background_music_task_handle);
-        }
-      }
-      else
-      {
-        ESP_LOGI(TAG, "Background music stopped");
-        // Stop background music task
-        if (background_music_task_handle != NULL)
-        {
-          vTaskDelete(background_music_task_handle);
-          background_music_task_handle = NULL;
-        }
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));  // 1-second delay before checking again
+    vTaskDelay(pdMS_TO_TICKS(100)); // Check every 100 ms
   }
 }
 
@@ -182,9 +150,23 @@ void app_main(void)
   new SDCard("/sdcard", PIN_NUM_MISO, PIN_NUM_MOSI, PIN_NUM_CLK, PIN_NUM_CS);
 #endif
 
+  DIR *dir = opendir("/sdcard");
+  if (dir) {
+      struct dirent *ent;
+      while ((ent = readdir(dir)) != NULL) {
+          ESP_LOGI(TAG, "Found file: %s", ent->d_name);
+      }
+      closedir(dir);
+  } else {
+      ESP_LOGE(TAG, "Cannot open /sdcard directory!");
+  } 
+
   gpio_set_direction(GPIO_BUTTON, GPIO_MODE_INPUT);
   gpio_set_pull_mode(GPIO_BUTTON, GPIO_PULLDOWN_ONLY);
+  gpio_set_direction(GPIO_BUTTON_1, GPIO_MODE_INPUT);
+  gpio_set_pull_mode(GPIO_BUTTON_1, GPIO_PULLDOWN_ONLY);
 
   // Start the button press handler task
-  xTaskCreate(handle_button_push, "handle_button_push", 8192, NULL, 1, NULL);
+  xTaskCreate(button_toggle_music_task, "button_toggle_music_task", 2048, NULL, 2, NULL);
+  xTaskCreate(button_trigger_mix_task, "button_trigger_mix_task", 2048, NULL, 2, NULL);
 }

@@ -22,7 +22,7 @@ void I2SOutput::start(int sample_rate)
         .fixed_mclk = 0};
     //install and start i2s driver
     i2s_driver_install(m_i2s_port, &i2s_config, 0, NULL);
-    // set up the i2s pins
+    // set up the i2s pins  
     i2s_set_pin(m_i2s_port, &m_i2s_pins);
     // clear the DMA buffers
     i2s_zero_dma_buffer(m_i2s_port);

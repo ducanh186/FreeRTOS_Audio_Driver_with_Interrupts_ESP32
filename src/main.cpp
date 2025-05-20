@@ -2,186 +2,233 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "freertos/event_groups.h"
+#include "freertos/timers.h"
+#include "driver/i2s.h"
+#include "driver/gpio.h"
 #include <dirent.h>
 #include <string.h>
-
 #include "I2SOutput.h"
 #include "SDCard.h"
 #include "SPIFFS.h"
 #include "WAVFileReader.h"
 #include "config.h"
-#include "esp_timer.h"
-#include "manage_sd.h"
 
 static const char *TAG = "app";
 extern "C" {
   void app_main(void);
 }
 
-// FreeRTOS Semaphores and Mutexes
-SemaphoreHandle_t sd_card_mutex;
-SemaphoreHandle_t audio_buffer_mutex;
-SemaphoreHandle_t mix_mutex;
-EventGroupHandle_t event_group;
+/*Task:
++ audio_processing_task: Đọc file WAV, mix âm thanh, gửi dữ liệu vào queue.
++ i2s_output_task: Lấy dữ liệu từ queue và phát qua I2S.
++ button_task: Xử lý sự kiện nút bấm qua ISR.
+*/
+// Định nghĩa hằng số
+#define SAMPLE_RATE 44100
+#define BUFFER_SIZE 1024
+#define QUEUE_SIZE 20 // Tăng kích thước queue để giảm underrun
+#define DEBOUNCE_TIME_MS 500 //Thời gian debounce (500ms) để loại bỏ nhiễu khi nhấn nút.
+
+// Biến toàn cục FreeRTOS
+static QueueHandle_t audio_queue;
+static EventGroupHandle_t event_group; //EventGroup để đồng bộ hóa trạng thái (phát, mix, dừng).
+static TimerHandle_t debounce_timer; //Timer phần mềm để debounce nút bấm.
 
 // Event Bits
-#define BIT_MUSIC_PLAYING    (1 << 0)
-#define BIT_MIX_REQUESTED    (1 << 1)
-#define BIT_BUTTON_PRESSED   (1 << 2)
+#define BIT_MUSIC_PLAYING (1 << 0)
+#define BIT_MIX_REQUESTED (1 << 1)
+#define BIT_BUTTON_PLAY (1 << 2)
+#define BIT_BUTTON_MIX (1 << 3)
+#define BIT_STOP_REQUESTED (1 << 4)
 
-// Global variables for managing playback state
-static bool is_main_music_playing = false;
-static TaskHandle_t main_music_task_handle = NULL;
-
-ManageSD *sdManager;
-
-// ISR handler for button press
-void IRAM_ATTR gpio_isr_handler(void *arg) {
+// ISR cho nút bấm
+/*   ISR (Interrupt Service Routine)
+Phản ứng nhanh với sự kiện phần cứng (như nhấn nút) mà không cần thăm dò (polling) liên tục, tiết kiệm CPU.
+IRAM (Internal RAM) 
+ISR tiêu tốn IRAM, giới hạn trên ESP32 (128 KB IRAM).
+*/
+void IRAM_ATTR button_play_isr_handler(void *arg) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xEventGroupSetBitsFromISR(event_group, BIT_BUTTON_PRESSED, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    xEventGroupSetBitsFromISR(event_group, BIT_BUTTON_PLAY, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
 }
 
-// Adapted play_with_mix function with mutex and event group synchronization
-void play_with_mix(Output *output, const char *main_fname, const char *mix_fname) {
-    int16_t *main_buf = (int16_t *)malloc(sizeof(int16_t) * 1024);
-    int16_t *mix_buf = (int16_t *)malloc(sizeof(int16_t) * 1024);
-    int16_t *output_buf = (int16_t *)malloc(sizeof(int16_t) * 1024);
+void IRAM_ATTR button_mix_isr_handler(void *arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xEventGroupSetBitsFromISR(event_group, BIT_BUTTON_MIX, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
+}
 
-    // Take SD card mutex to safely open files
-    if (xSemaphoreTake(sd_card_mutex, portMAX_DELAY) == pdTRUE) {
-        FILE *main_fp = fopen(main_fname, "rb");
-        FILE *mix_fp = fopen(mix_fname, "rb");
-        if (!main_fp || !mix_fp) {
-            ESP_LOGE(TAG, "Failed to open files");
-            free(main_buf); free(mix_buf); free(output_buf);
-            if (main_fp) fclose(main_fp);
-            if (mix_fp) fclose(mix_fp);
-            xSemaphoreGive(sd_card_mutex);
-            return;
-        }
-        xSemaphoreGive(sd_card_mutex); // Release mutex after opening files
+// Callback cho timer debounce
+void debounce_timer_callback(TimerHandle_t xTimer) {
+    // Không cần xử lý, chỉ dùng để đảm bảo debounce
+    // Không hiểu cái này lắmlắm
+}
 
-        WAVFileReader *main_reader = new WAVFileReader(main_fp);
-        WAVFileReader *mix_reader = new WAVFileReader(mix_fp);
+// Task đọc và mixing âm thanh
+void audio_processing_task(void *pvParameters) {
+    I2SOutput *output = new I2SOutput(I2S_NUM_0, i2s_speaker_pins);
+    int16_t *main_buf = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
+    int16_t *mix_buf = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
+    int16_t *output_buf = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
+    if (!main_buf || !mix_buf || !output_buf) {
+        ESP_LOGE(TAG, "Not enough memory for buffers");
+        delete output;
+        vTaskDelete(NULL);
+    }
 
-        ESP_LOGI(TAG, "Sample rate file 1: %d", main_reader->sample_rate());
-        ESP_LOGI(TAG, "Sample rate file 2: %d", mix_reader->sample_rate());
-        output->start(main_reader->sample_rate() * 2);
-
-        while (is_main_music_playing) {
-            int main_samples = main_reader->read(main_buf, 1024);
-            if (main_samples == 0) break;
-
-            // Check for mix request using event group
-            EventBits_t bits = xEventGroupGetBits(event_group);
-            if (bits & BIT_MIX_REQUESTED) {
-                int mix_samples = mix_reader->read(mix_buf, main_samples);
-                if (xSemaphoreTake(mix_mutex, portMAX_DELAY) == pdTRUE) {
-                    for (int i = 0; i < main_samples; i++) {
-                        int32_t mixed = main_buf[i];
-                        if (i < mix_samples) {
-                            mixed += mix_buf[i];
-                            output_buf[i] = mixed / 2;
-                        } else {
-                            output_buf[i] = main_buf[i];
-                        }
-                    }
-                    xSemaphoreGive(mix_mutex);
-                }
-                if (mix_samples == 0) {
-                    xEventGroupClearBits(event_group, BIT_MIX_REQUESTED);
-                    fseek(mix_fp, 44, SEEK_SET); // Reset mix file to start
-                }
-            } else {
-                memcpy(output_buf, main_buf, main_samples * sizeof(int16_t));
-            }
-
-            // Write to audio buffer with mutex protection
-            if (xSemaphoreTake(audio_buffer_mutex, portMAX_DELAY) == pdTRUE) {
-                output->write(output_buf, main_samples);
-                xSemaphoreGive(audio_buffer_mutex);
-            }
-        }
-
-        ESP_LOGI(TAG, "Finished playing main music");
-        output->stop();
-        delete main_reader;
-        delete mix_reader;
+    FILE *main_fp = fopen("/sdcard/gong.wav", "rb");
+    FILE *mix_fp = fopen("/sdcard/huh.wav", "rb");
+    if (!main_fp || !mix_fp) {
+        ESP_LOGE(TAG, "Cannot open WAV files");
         if (main_fp) fclose(main_fp);
         if (mix_fp) fclose(mix_fp);
         free(main_buf); free(mix_buf); free(output_buf);
+        delete output;
+        vTaskDelete(NULL);
     }
-}
 
-void main_music_task(void *pvParameters) {
-    I2SOutput *output = new I2SOutput(I2S_NUM_0, i2s_speaker_pins);
-    play_with_mix(output, "/sdcard/gong.wav", "/sdcard/huh.wav");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    delete output;
-    main_music_task_handle = NULL;
-    vTaskDelete(NULL); // Self delete when done
-}
+    WAVFileReader *main_reader = new WAVFileReader(main_fp);
+    WAVFileReader *mix_reader = new WAVFileReader(mix_fp);
 
-void button_toggle_music_task(void *pvParameters) {
-    while (true) {
-        if (xEventGroupWaitBits(event_group, BIT_BUTTON_PRESSED, pdTRUE, pdFALSE, portMAX_DELAY)) {
-            ESP_LOGI(TAG, "Button pressed");
-            is_main_music_playing = !is_main_music_playing;
-            if (is_main_music_playing) {
-                ESP_LOGI(TAG, "Main music started playing");
-                if (main_music_task_handle == NULL) {
-                    xTaskCreate(main_music_task, "main_music_task", 4096, NULL, 1, &main_music_task_handle);
+    ESP_LOGI(TAG, "Sample rate: %d", main_reader->sample_rate());
+    output->start(main_reader->sample_rate());
+
+    while (xEventGroupGetBits(event_group) & BIT_MUSIC_PLAYING) {
+        if (xEventGroupGetBits(event_group) & BIT_STOP_REQUESTED) {
+            break;
+        }
+
+        int main_samples = main_reader->read(main_buf, BUFFER_SIZE);
+        if (main_samples <= 0) break;
+
+        if (xEventGroupGetBits(event_group) & BIT_MIX_REQUESTED) {
+            int mix_samples = mix_reader->read(mix_buf, main_samples);
+            for (int i = 0; i < main_samples; i++) {
+                if (i < mix_samples) {
+                    int32_t mixed = (int32_t)main_buf[i] + (int32_t)mix_buf[i];
+                    output_buf[i] = (int16_t)(mixed / 2);
+                } else {
+                    output_buf[i] = main_buf[i];
                 }
             }
+            if (mix_samples < main_samples) {
+                xEventGroupClearBits(event_group, BIT_MIX_REQUESTED);
+                fseek(mix_fp, 44, SEEK_SET);
+            }
+        } else {
+            memcpy(output_buf, main_buf, main_samples * sizeof(int16_t));
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // Wait before checking again
+
+        // Dùng xQueueOverwrite để ưu tiên dữ liệu mới nếu queue đầy
+        if (!xQueueOverwrite(audio_queue, output_buf)) {
+            ESP_LOGW(TAG, "Queue full, overwriting data");
+        }
     }
+
+    output->stop();
+    delete main_reader;
+    delete mix_reader;
+    fclose(main_fp);
+    fclose(mix_fp);
+    free(main_buf); free(mix_buf); free(output_buf);
+    delete output;
+    xEventGroupClearBits(event_group, BIT_MUSIC_PLAYING | BIT_STOP_REQUESTED);
+    vTaskDelete(NULL);
 }
 
-void button_trigger_mix_task(void *pvParameters) {
-    while (true) {
-        if (xEventGroupWaitBits(event_group, BIT_BUTTON_PRESSED, pdTRUE, pdFALSE, portMAX_DELAY)) {
-            ESP_LOGI(TAG, "Button pressed - mix requested");
-            EventBits_t bits = xEventGroupGetBits(event_group);
-            if (bits & BIT_MIX_REQUESTED) {
-                xEventGroupClearBits(event_group, BIT_MIX_REQUESTED);
-            } else {
-                xEventGroupSetBits(event_group, BIT_MIX_REQUESTED);
+// Task phát âm thanh qua I2S
+void i2s_output_task(void *pvParameters) {
+    int16_t *buffer = (int16_t *)malloc(BUFFER_SIZE * sizeof(int16_t));
+    if (!buffer) {
+        ESP_LOGE(TAG, "Not enough memory for buffer");
+        vTaskDelete(NULL);
+    }
+
+    while (xEventGroupGetBits(event_group) & BIT_MUSIC_PLAYING) {
+        if (xQueueReceive(audio_queue, buffer, portMAX_DELAY) == pdTRUE) {
+            size_t bytes_written;
+            i2s_write(I2S_NUM_0, buffer, BUFFER_SIZE * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+            if (bytes_written != BUFFER_SIZE * sizeof(int16_t)) {
+                ESP_LOGW(TAG, "Not all data written to I2S");
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // Wait before checking again
+    }
+    free(buffer);
+    vTaskDelete(NULL);
+}
+
+// Task xử lý nút bấm
+void button_task(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    while (1) {
+        EventBits_t bits = xEventGroupWaitBits(event_group, BIT_BUTTON_PLAY | BIT_BUTTON_MIX, pdTRUE, pdFALSE, portMAX_DELAY);
+        if (bits & BIT_BUTTON_PLAY) {
+            ESP_LOGI(TAG, "GPIO_BUTTON pressed");
+            if (xEventGroupGetBits(event_group) & BIT_MUSIC_PLAYING) {
+                ESP_LOGI(TAG, "Main music stopping");
+                xEventGroupSetBits(event_group, BIT_STOP_REQUESTED);
+            } else {
+                ESP_LOGI(TAG, "Main music starting");
+                xEventGroupSetBits(event_group, BIT_MUSIC_PLAYING);
+                xTaskCreate(audio_processing_task, "audio_processing_task", 4096, NULL, 5, NULL);
+                xTaskCreate(i2s_output_task, "i2s_output_task", 4096, NULL, 5, NULL);
+            }
+            xTimerStart(debounce_timer, 0); // Bắt đầu timer debounce
+        }
+        if (bits & BIT_BUTTON_MIX) {
+            ESP_LOGI(TAG, "GPIO_BUTTON_1 pressed - mix requested");
+            xEventGroupSetBits(event_group, BIT_MIX_REQUESTED);
+            xTimerStart(debounce_timer, 0);
+        }
+        // Dùng vTaskDelayUntil để kiểm soát tần suất
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
     }
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "Starting up");
+    ESP_LOGI(TAG, "Starting audio player with deep OS integration");
 
-    // Initialize semaphores and mutexes
-    sd_card_mutex = xSemaphoreCreateMutex();
-    audio_buffer_mutex = xSemaphoreCreateMutex();
-    mix_mutex = xSemaphoreCreateMutex();
+#ifdef USE_SPIFFS
+    ESP_LOGI(TAG, "Mounting SPIFFS on /sdcard");
+    new SPIFFS("/sdcard");
+#else
+    ESP_LOGI(TAG, "Mounting SDCard on /sdcard");
+    new SDCard("/sdcard", PIN_NUM_MISO, PIN_NUM_MOSI, PIN_NUM_CLK, PIN_NUM_CS);
+#endif
+
+    // Kiểm tra nội dung thẻ SD
+    DIR *dir = opendir("/sdcard");
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL) {
+            ESP_LOGI(TAG, "Found file: %s", ent->d_name);
+        }
+        closedir(dir);
+    } else {
+        ESP_LOGE(TAG, "Cannot open /sdcard directory!");
+    }
+
+    // Khởi tạo FreeRTOS components
     event_group = xEventGroupCreate();
+    audio_queue = xQueueCreate(QUEUE_SIZE, BUFFER_SIZE * sizeof(int16_t));
+    debounce_timer = xTimerCreate("debounce_timer", pdMS_TO_TICKS(DEBOUNCE_TIME_MS), pdFALSE, NULL, debounce_timer_callback);
 
-    // Initialize SD card and manage SD
-    SDCard *sdCard = new SDCard("/sdcard", PIN_NUM_MISO, PIN_NUM_MOSI, PIN_NUM_CLK, PIN_NUM_CS);
-    sdManager = new ManageSD(sdCard);
-
-    // List files in the SD card directory
-    sdManager->listFiles("/sdcard");
-
-    // Set up GPIO interrupt for button press
+    // Cấu hình GPIO cho nút bấm
     gpio_set_direction(GPIO_BUTTON, GPIO_MODE_INPUT);
     gpio_set_pull_mode(GPIO_BUTTON, GPIO_PULLDOWN_ONLY);
     gpio_set_direction(GPIO_BUTTON_1, GPIO_MODE_INPUT);
     gpio_set_pull_mode(GPIO_BUTTON_1, GPIO_PULLDOWN_ONLY);
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(GPIO_BUTTON, gpio_isr_handler, NULL);
-    gpio_isr_handler_add(GPIO_BUTTON_1, gpio_isr_handler, NULL);
+    gpio_isr_handler_add(GPIO_BUTTON, button_play_isr_handler, NULL);
+    gpio_isr_handler_add(GPIO_BUTTON_1, button_mix_isr_handler, NULL);
 
-    // Start the button press handler tasks
-    xTaskCreate(button_toggle_music_task, "button_toggle_music_task", 2048, NULL, 2, NULL);
-    xTaskCreate(button_trigger_mix_task, "button_trigger_mix_task", 2048, NULL, 2, NULL);
+    // Tạo task xử lý nút bấm
+    xTaskCreate(button_task, "button_task", 2048, NULL, 2, NULL);
 }
